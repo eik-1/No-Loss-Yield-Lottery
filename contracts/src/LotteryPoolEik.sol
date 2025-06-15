@@ -24,6 +24,8 @@ contract LotteryPool is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Re
     error LotteryPool__LotteryNotOpen();
     error LotteryPool__UpkeepNotNeeded();
     error LotteryPool__AaveDepositFailed();
+    error LotteryPool__RequestNotFound();
+    error LotteryPool__NoEligibleUsers();
 
     enum LotteryState {
         OPEN,
@@ -35,6 +37,8 @@ contract LotteryPool is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Re
     // EVENTS      //
     /////////////////
     event TicketPurchased(address indexed user, uint256 amount);
+    event RequestSent(uint256 indexed requestId);
+    event RequestFulfilled(uint256 indexed requestId, uint256[] randomWords);
 
     ///////////////////////
     // STATE VARIABLES   //
@@ -46,6 +50,15 @@ contract LotteryPool is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Re
     bytes32 private immutable i_keyHash;
     uint16 private constant REQUEST_CONFIRMATIONS = 3;
     uint32 private immutable i_callbackGasLimit;
+    struct RequestStatus {
+        bool fulfilled;
+        bool exists; 
+        uint256[] randomWords;
+    }
+    mapping(uint256 => RequestStatus)
+        public s_requests; 
+    uint256 public s_lastRequestId;
+    uint256[] public s_requestIds;
 
     /* Chainlink Automation */
     uint256 public s_lastTimeStamp;
@@ -184,12 +197,44 @@ contract LotteryPool is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Re
         });
 
         uint256 requestId = s_vrfCoordinator.requestRandomWords(request);
+        s_requests[requestId] = RequestStatus({
+            randomWords: new uint256[](0),
+            exists: true,
+            fulfilled: false
+        });
+        s_requestIds.push(requestId);
+        s_lastRequestId = requestId;
+        emit RequestSent(requestId);
     }
 
-    function fulfillRandomWords(uint256 /* requestId */, uint256[] calldata randomWords) internal override {
-        uint256 winnerIndex = randomWords[0] % s_users.length;
-        address winner = s_users[winnerIndex];
+    function fulfillRandomWords(uint256 requestId , uint256[] calldata _randomWords) internal override {
+        if (!s_requests[requestId].exists) revert LotteryPool__RequestNotFound();
+        s_requests[requestId].fulfilled = true;
+        s_requests[requestId].randomWords = _randomWords;
+        emit RequestFulfilled(requestId, _randomWords);
+
+        address[] memory eligibleUsers = new address[](s_users.length);
+        uint256 eligibleUserCount = 0;
+
+        for(uint256 i = 0; i < s_users.length; i++) {
+            if(s_ticketsPerRoundPerUser[s_users[i]][s_currentRound] > 0) {
+                eligibleUsers[eligibleUserCount] = s_users[i];
+                eligibleUserCount++;
+            }
+        }
+
+        if (eligibleUserCount == 0) revert LotteryPool__NoEligibleUsers();
+
+        uint256 winnerIndex = _randomWords[0] % eligibleUserCount;
+        address winner = eligibleUsers[winnerIndex];
         s_previousWinner = winner;
+
+        // Reset the lottery
+        s_lotteryState = LotteryState.OPEN;
+        s_lastTimeStamp = block.timestamp;
+        s_currentRound++;
+
+
 
         
     }
