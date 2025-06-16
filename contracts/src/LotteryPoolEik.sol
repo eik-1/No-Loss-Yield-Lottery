@@ -26,6 +26,11 @@ contract LotteryPool is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Re
     error LotteryPool__AaveDepositFailed();
     error LotteryPool__RequestNotFound();
     error LotteryPool__NoEligibleUsers();
+    error LotteryPool__NoInterestAccrued();
+    error Lottery_NoInterestAccrued();
+    error LotteryPool__AaveWithdrawFailed();
+    error LotteryPool__InvalidAddress();
+    error LotteryPool__NoStakes();
 
     enum LotteryState {
         OPEN,
@@ -39,6 +44,8 @@ contract LotteryPool is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Re
     event TicketPurchased(address indexed user, uint256 amount);
     event RequestSent(uint256 indexed requestId);
     event RequestFulfilled(uint256 indexed requestId, uint256[] randomWords);
+    event WinnerSelected(address indexed winner, uint256 amount);
+    event AutoCompounded(uint256 amount);
 
     ///////////////////////
     // STATE VARIABLES   //
@@ -234,23 +241,182 @@ contract LotteryPool is VRFConsumerBaseV2Plus, AutomationCompatibleInterface, Re
         s_lastTimeStamp = block.timestamp;
         s_currentRound++;
 
+        // Calculate yield as aUSDC balance minus total staked
+        uint256 totalStaked = getTotalStaked();
+        uint256 currentBalance = i_aEthLink.balanceOf(address(this));
+        if (currentBalance <= totalStaked) revert Lottery_NoInterestAccrued();
+        uint256 yield = currentBalance - totalStaked;
+        s_totalYieldGenerated += yield;
 
+        // Calculate platform fee and winner amount
+        uint256 fee = (yield * FEE_BPS) / BPS_DENOMINATOR;
+        uint256 winnerAmount = yield - fee;
 
+        // Withdraw fee from Aave and send to platform
+        if (fee > 0) {
+            (bool feeSuccess, ) = i_aaveLendingPool.call(
+                abi.encodeWithSignature(
+                    "withdraw(address,uint256,address)",
+                    address(i_link),
+                    fee,
+                    s_platformFeeRecipient
+                )
+            );
+            if (!feeSuccess) revert LotteryPool__AaveWithdrawFailed();
+        }
+
+        // Withdraw winner amount from Aave and send to winner
+        (bool winnerSuccess, ) = i_aaveLendingPool.call(
+            abi.encodeWithSignature(
+                "withdraw(address,uint256,address)",
+                address(i_link),
+                winnerAmount,
+                winner
+            )
+        );
+        if (!winnerSuccess) revert LotteryPool__AaveWithdrawFailed();
+
+        emit WinnerSelected(winner, winnerAmount);
+        emit AutoCompounded(totalStaked);
+    }
+
+    function getRequestStatus(
+        uint256 _requestId
+    ) external view returns (bool fulfilled, uint256[] memory randomWords) {
+        if (!s_requests[_requestId].exists) revert LotteryPool__RequestNotFound();
+        RequestStatus memory request = s_requests[_requestId];
+        return (request.fulfilled, request.randomWords);
+    }
+
+    function withdrawInterest(address to) external onlyOwner {
+        if (to == address(0)) revert LotteryPool__InvalidAddress();
+
+        uint256 totalStaked = getTotalStaked();
+        uint256 currentBalance = i_aEthLink.balanceOf(address(this));
+        if (currentBalance <= totalStaked) revert LotteryPool__NoInterestAccrued();
+        uint256 interest = currentBalance - totalStaked;
+        (bool success, ) = i_aaveLendingPool.call(
+            abi.encodeWithSignature(
+                "withdraw(address,uint256,address)",
+                address(i_link),
+                interest,
+                to
+            )
+        );
+        if (!success) revert LotteryPool__AaveWithdrawFailed();
+    }
+
+    /**
+    * @notice Allows a user to withdraw all of their staked LINK back
+    * @dev Removes the user from the s_users array
+    * @dev It updates the s_ticketsPerRoundPerUser mapping & s_userStakes mapping
+    * @dev Withdraws from Aave and sends to the user
+    */
+    function withdrawAllOfAUserStakes() external nonReentrant {
+        uint256 refundAmount = s_userStakes[msg.sender];
+        if (refundAmount == 0) revert LotteryPool__NoStakes();
+
+        // Remove user from s_users array
+        for (uint256 i = 0; i < s_users.length; i++) {
+            if (s_users[i] == msg.sender) {
+                // Replace with last element and pop
+                s_users[i] = s_users[s_users.length - 1];
+                s_users.pop();
+                break;
+            }
+        }
+
+        // Clear user tickets for current and next round
+        s_ticketsPerRoundPerUser[msg.sender][s_currentRound] = 0;
+        s_ticketsPerRoundPerUser[msg.sender][s_currentRound + 1] = 0;
         
+        // Reset user stakes
+        s_userStakes[msg.sender] = 0;
+
+        // Withdraw from Aave and transfer to user
+        (bool success, ) = i_aaveLendingPool.call(
+            abi.encodeWithSignature(
+                "withdraw(address,uint256,address)",
+                address(i_link),
+                refundAmount,
+                msg.sender
+            )
+        );
+        if (!success) revert LotteryPool__AaveWithdrawFailed();
     }
 
-    function sendYieldToWinner(address winner) internal {
+    /**
+     * @notice Allows the owner to withdraw all LINK from the contract if the lottery is paused
+     * @dev Can only be called if the lottery is paused
+     */
+    function emergencyWithdraw() external whenPaused nonReentrant {
+        uint256 refundAmount = s_userStakes[msg.sender];
+        if (refundAmount == 0) revert LotteryPool__NoStakes();
 
+        // Remove user from s_users array
+        for (uint256 i = 0; i < s_users.length; i++) {
+            if (s_users[i] == msg.sender) {
+                // Replace with last element and pop
+                s_users[i] = s_users[s_users.length - 1];
+                s_users.pop();
+                break;
+            }
+        }
+
+        // Clear user tickets for current and next round
+        s_ticketsPerRoundPerUser[msg.sender][s_currentRound] = 0;
+        s_ticketsPerRoundPerUser[msg.sender][s_currentRound + 1] = 0;
+        
+        // Reset user stakes
+        s_userStakes[msg.sender] = 0;
+
+        // Withdraw from Aave and transfer to user
+        (bool success, ) = i_aaveLendingPool.call(
+            abi.encodeWithSignature(
+                "withdraw(address,uint256,address)",
+                address(i_link),
+                refundAmount,
+                msg.sender
+            )
+        );
+        if (!success) revert LotteryPool__AaveWithdrawFailed();
     }
 
-    function closeLottery() internal {}
+    function closeLottery() external onlyOwner {
+
+    }
 
     ///////////////
     // GETTERS   //
     ///////////////
 
+    function getTotalStaked() public view returns (uint256) {
+        uint256 total = 0;
+        for (uint256 i = 0; i < s_users.length; i++) {
+            total += s_userStakes[s_users[i]];
+        }
+        return total;
+    }
+
+    function getAaveInvestmentBalance() external view returns (uint256) {
+        return i_aEthLink.balanceOf(address(this));
+    }
+
     function getLotteryState() public view returns (LotteryState) {
         return s_lotteryState;
+    }
+
+    function getTotalYieldGenerated() public view returns (uint256) {
+        return s_totalYieldGenerated;
+    }
+
+    function getTimeUntilNextRound() public view returns (uint256) {
+        uint256 nextDrawTime = s_lastTimeStamp + s_interval;
+        if (block.timestamp >= nextDrawTime) {
+            return 0;
+        } else {
+            return nextDrawTime - block.timestamp;
+        }
     }
 
     function getTicketCost() public view returns (uint256) {
